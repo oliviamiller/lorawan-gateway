@@ -8,11 +8,11 @@ package gateway
 #include "../sx1302/libloragw/inc/loragw_hal.h"
 #include "gateway.h"
 #include <stdlib.h>
-
 */
 import "C"
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -108,6 +108,9 @@ func NewGateway(
 		started: false,
 	}
 
+	// capture c log output
+	g.workers = utils.NewBackgroundStoppableWorkers(g.captureCOutputToLogs)
+
 	err := g.Reconfigure(ctx, deps, conf)
 	if err != nil {
 		return nil, err
@@ -122,7 +125,6 @@ func (g *Gateway) Reconfigure(ctx context.Context, deps resource.Dependencies, c
 	if err != nil {
 		return err
 	}
-
 	// Determine if the pi is on bookworm or bullseye
 	osRelease, err := os.ReadFile("/etc/os-release")
 	if err != nil {
@@ -162,50 +164,98 @@ func (g *Gateway) Reconfigure(ctx context.Context, deps resource.Dependencies, c
 
 	errCode := C.setUpGateway(C.int(cfg.Bus))
 	if errCode != 0 {
-		return fmt.Errorf("failed to start the gateway %d", errCode)
+		strErr := parseErrorCode(int(errCode))
+		return fmt.Errorf("failed to set up the gateway: %s", strErr)
 	}
 
 	g.started = true
-	g.receivePackets()
+	g.workers.Add(g.receivePackets)
 
 	return nil
 }
 
-func (g *Gateway) receivePackets() {
+func parseErrorCode(errCode int) string {
+	switch errCode {
+	case 1:
+		return "error setting the board config"
+	case 2:
+		return "error setting the radio frequency config for radio 0"
+	case 3:
+		return "error setting the radio frequency config for radio 1"
+	case 4:
+		return "error setting the intermediate frequency chain config"
+	case 5:
+		return "error starting the gateway"
+	default:
+		return "unknown error"
+	}
+}
+
+// captureOutput is a background routine to capture C's stdout and log to the module's logger.
+// This is necessary because the sx1302 library only uses printf to report errors.
+func (g *Gateway) captureCOutputToLogs(ctx context.Context) {
+	// Need to disable buffering on stdout so C logs can be displayed in real time.
+	C.disableBuffering()
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		g.logger.Errorf("unable to create pipe for C logs")
+		return
+	}
+	// Redirect C's stdout to the write end of the pipe
+	C.redirectToPipe(C.int(stdoutW.Fd()))
+	scanner := bufio.NewScanner(stdoutR)
+	// loop to read lines from the scanner and log them
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if scanner.Scan() {
+				line := scanner.Text()
+				if strings.Contains(line, "ERROR") {
+					g.logger.Error(line)
+				} else {
+					g.logger.Debug(line)
+				}
+			}
+		}
+	}
+}
+
+func (g *Gateway) receivePackets(ctx context.Context) {
 	// receive the radio packets
 	packet := C.createRxPacketArray()
-	g.workers = utils.NewBackgroundStoppableWorkers(func(ctx context.Context) {
-		for {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		numPackets := int(C.receive(packet))
+		switch numPackets {
+		case 0:
+			// no packet received, wait 10 ms to receive again.
 			select {
 			case <-ctx.Done():
 				return
-			default:
+			case <-time.After(10 * time.Millisecond):
 			}
-			numPackets := int(C.receive(packet))
-			switch numPackets {
-			case 0:
-				// no packet received, wait 10 ms to receive again.
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(10 * time.Millisecond):
-				}
-			case 1:
-				// received a LORA packet
-				var payload []byte
-				if packet.size == 0 {
-					continue
-				}
-				// Convert packet to go byte array
-				for i := range int(packet.size) {
-					payload = append(payload, byte(packet.payload[i]))
-				}
-				g.handlePacket(ctx, payload)
-			default:
-				g.logger.Errorf("error receiving lora packet")
+		case 1:
+			// received a LORA packet
+			var payload []byte
+			if packet.size == 0 {
+				continue
 			}
+			// Convert packet to go byte array
+			for i := range int(packet.size) {
+				payload = append(payload, byte(packet.payload[i]))
+			}
+			g.handlePacket(ctx, payload)
+		default:
+			g.logger.Errorf("error receiving lora packet")
 		}
-	})
+	}
 }
 
 func (g *Gateway) handlePacket(ctx context.Context, payload []byte) {

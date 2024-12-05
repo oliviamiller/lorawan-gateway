@@ -28,7 +28,6 @@ const int32_t rfChains [9] = {0, 0, 0, 0, 1, 1, 1};
 
 
 int setUpGateway(int bus) {
-
     // the board config defines parameters for the entire gateway HAT.
     struct lgw_conf_board_s boardconf;
 
@@ -92,11 +91,10 @@ int setUpGateway(int bus) {
             return 4;
         }
     }
-    
+
     // start the gateway.
     int res = lgw_start();
     if (res != LGW_HAL_SUCCESS) {
-        fprintf(stderr, "lgw_start failed with code: %d\n", res);
         return 5;
     }
     return 0;
@@ -116,5 +114,14 @@ int receive(struct lgw_pkt_rx_s* packet)  {
 
 int send(struct lgw_pkt_tx_s* packet) {
     return lgw_send(packet);
+}
+
+void disableBuffering() {
+    setbuf(stdout, NULL);
+}
+
+void redirectToPipe(int fd) {
+    fflush(stdout);          // Flush anything in the current stdout buffer
+    dup2(fd, STDOUT_FILENO); // Redirect stdout to the pipe's file descriptor
 }
 
