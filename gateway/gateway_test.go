@@ -288,7 +288,7 @@ func TestStartCLogging(t *testing.T) {
 
 	// Ensure logging is started if there is no entry in the loggingRoutineStarted map.
 	g.startCLogging(ctx)
-	test.That(t, g.workers, test.ShouldNotBeNil)
+	test.That(t, g.loggingWorker, test.ShouldNotBeNil)
 	test.That(t, len(loggingRoutineStarted), test.ShouldEqual, 1)
 	test.That(t, loggingRoutineStarted["test-gateway"], test.ShouldBeTrue)
 
@@ -299,10 +299,10 @@ func TestStartCLogging(t *testing.T) {
 
 	// Ensure no new goroutine is started if the loggingRoutineStarted entry is true.
 	// reset fields for new test case
-	g.workers = nil
+	g.loggingWorker = nil
 	loggingRoutineStarted["test-gateway"] = true
 	g.startCLogging(ctx)
-	test.That(t, g.workers, test.ShouldBeNil)
+	test.That(t, g.loggingWorker, test.ShouldBeNil)
 	test.That(t, len(loggingRoutineStarted), test.ShouldEqual, 1)
 	test.That(t, loggingRoutineStarted["test-gateway"], test.ShouldBeTrue)
 }
