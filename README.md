@@ -33,6 +33,7 @@ The following attributes are available for `viam:sensor:sx1302-gateway` sensors:
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
+| board | string | yes | - | Name of the board connected to the HAT |
 | reset_pin | int | yes | - | GPIO pin number for sx1302 reset pin |
 | spi_bus | int | no | 0 | SPI bus number (0 or 1) |
 | power_en_pin | int | no | - | GPIO pin number for the power enable pin |
@@ -46,6 +47,7 @@ Example gateway configuration:
       "model": "viam:sensor:sx1302-gateway",
       "type": "sensor",
       "attributes": {
+        "board": "rpi",
         "spi_bus": 0,
         "reset_pin": 17,
         "power_en_pin": 27
@@ -133,6 +135,8 @@ The gateway will log info logs when it has received a join request or data uplin
 The gateway communicates through SPI, ensure that SPI in enabled on the pi.
 
 To avoid capturing duplicate data, set the data capture frequency equal to or less than the expected uplink interval.
+
+If the error `ERROR: Failed to set SX1250_0 in STANDBY_RC mode` is seen in logs, unplug the raspberry pi for a few minutes and then try again.
 
 ## Hardware Tested
 The sx1302-gateway model has been tested with:\

@@ -2,9 +2,8 @@ package gateway
 
 import (
 	"context"
-	"testing"
-
 	"gateway/node"
+	"testing"
 
 	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/data"
@@ -18,33 +17,49 @@ func TestValidate(t *testing.T) {
 	// Test valid config with default bus
 	resetPin := 25
 	conf := &Config{
-		ResetPin: &resetPin,
+		BoardName: "pi",
+		ResetPin:  &resetPin,
 	}
 	deps, err := conf.Validate("")
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, deps, test.ShouldBeNil)
+	test.That(t, len(deps), test.ShouldEqual, 1)
 
 	// Test valid config with bus=1
 	conf = &Config{
-		ResetPin: &resetPin,
-		Bus:      1,
+		BoardName: "pi",
+		ResetPin:  &resetPin,
+		Bus:       1,
 	}
 	deps, err = conf.Validate("")
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, deps, test.ShouldBeNil)
+	test.That(t, len(deps), test.ShouldEqual, 1)
 
 	// Test missing reset pin
-	conf = &Config{}
-	_, err = conf.Validate("")
-	test.That(t, err, test.ShouldBeError, resource.NewConfigValidationError("", errResetPinRequired))
+	conf = &Config{
+		BoardName: "pi",
+	}
+	deps, err = conf.Validate("")
+	test.That(t, err, test.ShouldBeError, resource.NewConfigValidationFieldRequiredError("", "reset_pin"))
+	test.That(t, deps, test.ShouldBeNil)
 
 	// Test invalid bus value
 	conf = &Config{
-		ResetPin: &resetPin,
-		Bus:      2,
+		BoardName: "pi",
+		ResetPin:  &resetPin,
+		Bus:       2,
 	}
-	_, err = conf.Validate("")
+	deps, err = conf.Validate("")
 	test.That(t, err, test.ShouldBeError, resource.NewConfigValidationError("", errInvalidSpiBus))
+	test.That(t, deps, test.ShouldBeNil)
+
+	// Test missing boardName
+	conf = &Config{
+		ResetPin: &resetPin,
+	}
+
+	deps, err = conf.Validate("")
+	test.That(t, err, test.ShouldBeError, resource.NewConfigValidationFieldRequiredError("", "board"))
+	test.That(t, deps, test.ShouldBeNil)
 }
 
 func TestDoCommand(t *testing.T) {
@@ -288,7 +303,7 @@ func TestStartCLogging(t *testing.T) {
 
 	// Ensure logging is started if there is no entry in the loggingRoutineStarted map.
 	g.startCLogging(ctx)
-	test.That(t, g.workers, test.ShouldNotBeNil)
+	test.That(t, g.loggingWorker, test.ShouldNotBeNil)
 	test.That(t, len(loggingRoutineStarted), test.ShouldEqual, 1)
 	test.That(t, loggingRoutineStarted["test-gateway"], test.ShouldBeTrue)
 
@@ -299,10 +314,10 @@ func TestStartCLogging(t *testing.T) {
 
 	// Ensure no new goroutine is started if the loggingRoutineStarted entry is true.
 	// reset fields for new test case
-	g.workers = nil
+	g.loggingWorker = nil
 	loggingRoutineStarted["test-gateway"] = true
 	g.startCLogging(ctx)
-	test.That(t, g.workers, test.ShouldBeNil)
+	test.That(t, g.loggingWorker, test.ShouldBeNil)
 	test.That(t, len(loggingRoutineStarted), test.ShouldEqual, 1)
 	test.That(t, loggingRoutineStarted["test-gateway"], test.ShouldBeTrue)
 }

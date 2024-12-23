@@ -16,15 +16,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"gateway/node"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"gateway/gpio"
-	"gateway/node"
-
+	"go.viam.com/rdk/components/board"
 	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/data"
 	"go.viam.com/rdk/logging"
@@ -35,8 +34,7 @@ import (
 // Error variables for validation and operations
 var (
 	// Config validation errors
-	errResetPinRequired = errors.New("reset pin is required")
-	errInvalidSpiBus    = errors.New("spi bus can be 0 or 1 - default 0")
+	errInvalidSpiBus = errors.New("spi bus can be 0 or 1 - default 0")
 
 	// Gateway operation errors
 	errUnexpectedJoinType = errors.New("unexpected join type when adding node to gateway")
@@ -57,9 +55,10 @@ var loggingRoutineStarted = make(map[string]bool)
 
 // Config describes the configuration of the gateway
 type Config struct {
-	Bus      int  `json:"spi_bus,omitempty"`
-	PowerPin *int `json:"power_en_pin,omitempty"`
-	ResetPin *int `json:"reset_pin"`
+	Bus       int    `json:"spi_bus,omitempty"`
+	PowerPin  *int   `json:"power_en_pin,omitempty"`
+	ResetPin  *int   `json:"reset_pin"`
+	BoardName string `json:"board"`
 }
 
 func init() {
@@ -73,31 +72,42 @@ func init() {
 
 // Validate ensures all parts of the config are valid.
 func (conf *Config) Validate(path string) ([]string, error) {
+	var deps []string
 	if conf.ResetPin == nil {
-		return nil, resource.NewConfigValidationError(path, errResetPinRequired)
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "reset_pin")
 	}
 	if conf.Bus != 0 && conf.Bus != 1 {
 		return nil, resource.NewConfigValidationError(path, errInvalidSpiBus)
 	}
-	return nil, nil
+
+	if len(conf.BoardName) == 0 {
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "board")
+	}
+	deps = append(deps, conf.BoardName)
+
+	return deps, nil
+
 }
 
 // Gateway defines a lorawan gateway.
 type gateway struct {
 	resource.Named
 	logger logging.Logger
+	mu     sync.Mutex
 
-	workers *utils.StoppableWorkers
-	mu      sync.Mutex
+	// Using two wait groups so we can stop the receivingWorker at reconfigure
+	// but keep the loggingWorker running.
+	loggingWorker   *utils.StoppableWorkers
+	receivingWorker *utils.StoppableWorkers
 
 	lastReadings map[string]interface{} // map of devices to readings
 	readingsMu   sync.Mutex
 
 	devices map[string]*node.Node // map of node name to node struct
 
-	started  bool
-	bookworm *bool
-	rstPin   string
+	started bool
+	rstPin  board.GPIOPin
+	pwrPin  board.GPIOPin
 }
 
 // NewGateway creates a new gateway
@@ -123,31 +133,29 @@ func NewGateway(
 
 // Reconfigure reconfigures the gateway.
 func (g *gateway) Reconfigure(ctx context.Context, deps resource.Dependencies, conf resource.Config) error {
-	cfg, err := resource.NativeConfig[*Config](conf)
-	if err != nil {
-		return err
-	}
-	// Determine if the pi is on bookworm or bullseye
-	osRelease, err := os.ReadFile("/etc/os-release")
-	if err != nil {
-		return fmt.Errorf("cannot determine os release: %w", err)
-	}
-	isBookworm := strings.Contains(string(osRelease), "bookworm")
-
-	g.bookworm = &isBookworm
-	g.rstPin = strconv.Itoa(*cfg.ResetPin)
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	// If the gateway hardware was already started, stop gateway and the background worker.
 	// Make sure to always call stopGateway() before making any changes to the c config or
 	// errors will occur.
-	// Unexpected behavior will also occur if you call stopGateway() when the gateway hasn't been
+	// Unexpected behavior will also occur if stopGateway() is called when the gateway hasn't been
 	// started, so only call stopGateway if this module already started the gateway.
 	if g.started {
-		err := g.Close(ctx)
+		err := g.reset(ctx)
 		if err != nil {
 			return err
 		}
-		g.started = false
+	}
+
+	cfg, err := resource.NativeConfig[*Config](conf)
+	if err != nil {
+		return err
+	}
+
+	board, err := board.FromDependencies(deps, cfg.BoardName)
+	if err != nil {
+		return err
 	}
 
 	// capture C log output
@@ -162,7 +170,23 @@ func (g *gateway) Reconfigure(ctx context.Context, deps resource.Dependencies, c
 		g.lastReadings = make(map[string]interface{})
 	}
 
-	err = gpio.InitGateway(cfg.ResetPin, cfg.PowerPin, isBookworm)
+	// adding io before the pin allows you to use the GPIO number.
+	rstPin, err := board.GPIOPinByName("io" + strconv.Itoa(*cfg.ResetPin))
+	if err != nil {
+		return err
+	}
+	g.rstPin = rstPin
+
+	// not every gateway has a power enable pin so it is optional.
+	if cfg.PowerPin != nil {
+		pwrPin, err := board.GPIOPinByName("io" + strconv.Itoa(*cfg.PowerPin))
+		if err != nil {
+			return err
+		}
+		g.pwrPin = pwrPin
+	}
+
+	err = resetGateway(ctx, g.rstPin, g.pwrPin)
 	if err != nil {
 		return fmt.Errorf("error initializing the gateway: %w", err)
 	}
@@ -174,8 +198,7 @@ func (g *gateway) Reconfigure(ctx context.Context, deps resource.Dependencies, c
 	}
 
 	g.started = true
-	g.workers.Add(g.receivePackets)
-
+	g.receivingWorker = utils.NewBackgroundStoppableWorkers(g.receivePackets)
 	return nil
 }
 
@@ -202,7 +225,7 @@ func (g *gateway) startCLogging(ctx context.Context) {
 	loggingState, ok := loggingRoutineStarted[g.Name().Name]
 	if !ok || !loggingState {
 		g.logger.Debug("Starting c logger background routine")
-		g.workers = utils.NewBackgroundStoppableWorkers(g.captureCOutputToLogs)
+		g.loggingWorker = utils.NewBackgroundStoppableWorkers(g.captureCOutputToLogs)
 		loggingRoutineStarted[g.Name().Name] = true
 	}
 }
@@ -236,6 +259,11 @@ func (g *gateway) captureCOutputToLogs(ctx context.Context) {
 			if scanner.Scan() {
 				line := scanner.Text()
 				switch {
+				case strings.Contains(line, "STANDBY_RC mode"):
+					// The error setting standby_rc mode indicates a hardware initiaization failure
+					// add extra log to instruct user what to do.
+					g.logger.Error(line)
+					g.logger.Error("gateway hardware is misconfigured: unplug the board and wait a few minutes before trying again")
 				case strings.Contains(line, "ERROR"):
 					g.logger.Error(line)
 				default:
@@ -282,7 +310,7 @@ func (g *gateway) receivePackets(ctx context.Context) {
 }
 
 func (g *gateway) handlePacket(ctx context.Context, payload []byte) {
-	g.workers.Add(func(ctx context.Context) {
+	g.receivingWorker.Add(func(ctx context.Context) {
 		// first byte is MHDR - specifies message type
 		switch payload[0] {
 		case 0x0:
@@ -453,20 +481,35 @@ func convertToBytes(key interface{}) ([]byte, error) {
 
 // Close closes the gateway.
 func (g *gateway) Close(ctx context.Context) error {
-	if g.rstPin != "" && g.bookworm != nil {
-		err := gpio.ResetGPIO(g.rstPin, *g.bookworm)
-		if err != nil {
-			g.logger.Error("error reseting gateway")
-		}
+	err := g.reset(ctx)
+	if err != nil {
+		return err
 	}
-	if g.workers != nil {
-		g.workers.Stop()
+
+	if g.loggingWorker != nil {
+		g.loggingWorker.Stop()
 		delete(loggingRoutineStarted, g.Name().Name)
+	}
+
+	return nil
+}
+
+func (g *gateway) reset(ctx context.Context) error {
+	// close the routine that receives lora packets - otherwise this will error when the gateway is stopped.
+	if g.receivingWorker != nil {
+		g.receivingWorker.Stop()
 	}
 	errCode := C.stopGateway()
 	if errCode != 0 {
 		g.logger.Error("error stopping gateway")
 	}
+	if g.rstPin != nil {
+		err := resetGateway(ctx, g.rstPin, g.pwrPin)
+		if err != nil {
+			g.logger.Error("error resetting the gateway")
+		}
+	}
+	g.started = false
 	return nil
 }
 
